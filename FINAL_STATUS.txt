@@ -1,0 +1,11 @@
+LIBRATECH HARDENED LOCAL BUILD
+
+Use this ZIP to replace the current local project.
+
+Default local Owner login:
+Username: owner
+Password: 12345
+
+For production, set OWNER_DEFAULT_PASSWORD to a strong unique secret before the first database initialization.
+
+The current frontend can be deployed as static assets to Netlify, but the SQLite backend in this package is NOT a persistent multi-instance Netlify backend. The online database migration must be completed before using Netlify as the real shared Client/Owner system.
