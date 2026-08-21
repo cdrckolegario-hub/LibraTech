@@ -2,7 +2,7 @@
   "name": "libratech-library-management-system",
   "version": "1.0.0",
   "private": true,
-  "description": "LibraTech — College Library Management System with real persistent SQLite database",
+  "description": "LibraTech - College Library Management System with PostgreSQL",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,8 +11,8 @@
     "node": ">=18"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "express": "^4.21.2",
-    "pg": "^8.23.0",
-    "sqlite3": "^5.1.7"
+    "pg": "^8.23.0"
   }
 }

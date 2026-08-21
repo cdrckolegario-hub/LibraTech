@@ -1,0 +1,264 @@
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const app = express();
+app.disable('x-powered-by');
+const PORT = Number(process.env.PORT || 3000);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const OWNER_DEFAULT_PASSWORD = process.env.OWNER_DEFAULT_PASSWORD || (IS_PRODUCTION ? '' : '12345');
+const MAX_BODY = '1mb';
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_MAX_ATTEMPTS = 8;
+const authBuckets = new Map();
+const normalize = v => String(v ?? '').trim();
+const validUsername = v => /^[A-Za-z0-9._-]{3,50}$/.test(normalize(v));
+const validEmail = v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalize(v)) && normalize(v).length <= 254;
+const validText = (v,max=255) => normalize(v).length > 0 && normalize(v).length <= max;
+function clientIp(req){ return String(req.ip || req.socket?.remoteAddress || 'unknown').replace(/^::ffff:/,''); }
+function authRateLimit(req,res,next){
+  const key = `${req.path}:${clientIp(req)}`;
+  const nowMs = Date.now();
+  let b = authBuckets.get(key);
+  if(!b || nowMs - b.start >= AUTH_WINDOW_MS){ b={start:nowMs,count:0}; authBuckets.set(key,b); }
+  b.count++;
+  if(b.count > AUTH_MAX_ATTEMPTS){
+    const retryAfter = Math.max(1,Math.ceil((b.start + AUTH_WINDOW_MS - nowMs)/1000));
+    res.setHeader('Retry-After',String(retryAfter));
+    return res.status(429).json({error:'Too many authentication attempts. Please try again later.',retryAfter});
+  }
+  next();
+}
+function sameOrigin(req,res,next){
+  if(!['POST','PUT','PATCH','DELETE'].includes(req.method) || !req.path.startsWith('/api/')) return next();
+  const origin=req.get('Origin');
+  if(!origin) return next();
+  const forwardedProto=String(req.get('x-forwarded-proto')||'').split(',')[0].trim();
+  const proto=forwardedProto || (IS_PRODUCTION ? 'https' : req.protocol);
+  const expected=`${proto}://${req.get('host')}`;
+  if(origin!==expected) return res.status(403).json({error:'Cross-origin request blocked.'});
+  next();
+}
+const SESSION_DAYS = Math.max(1, Math.min(30, Number(process.env.SESSION_DAYS || 7)));
+const ROOT = __dirname;
+const DB_DIR = path.join(ROOT, 'database');
+const DB_FILE = path.join(DB_DIR, 'libratech.db');
+fs.mkdirSync(DB_DIR, { recursive: true });
+
+const db = new sqlite3.Database(DB_FILE);
+db.serialize(() => db.run('PRAGMA foreign_keys = ON'));
+
+const run = (sql, params=[]) => new Promise((resolve,reject)=>db.run(sql,params,function(err){ if(err) reject(err); else resolve({id:this.lastID,changes:this.changes}); }));
+const exec = (sql) => new Promise((resolve,reject)=>db.exec(sql, err=>err?reject(err):resolve()));
+const get = (sql, params=[]) => new Promise((resolve,reject)=>db.get(sql,params,(err,row)=>err?reject(err):resolve(row)));
+const all = (sql, params=[]) => new Promise((resolve,reject)=>db.all(sql,params,(err,rows)=>err?reject(err):resolve(rows)));
+let txChain = Promise.resolve();
+const tx = (fn) => {
+  const next = txChain.then(async()=>{
+    await run('BEGIN IMMEDIATE');
+    try { const value=await fn(); await run('COMMIT'); return value; }
+    catch(e){ try{await run('ROLLBACK');}catch{} throw e; }
+  });
+  txChain = next.catch(()=>{});
+  return next;
+};
+
+function now(){ return new Date(); }
+function iso(d=now()){ return new Date(d).toISOString(); }
+function addDays(date, days){ const d=new Date(date); d.setDate(d.getDate()+days); return d; }
+function hashPassword(password, salt=crypto.randomBytes(16).toString('hex')){
+  const hash=crypto.scryptSync(password,salt,64).toString('hex'); return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored){
+  const [salt,hex]=String(stored||'').split(':'); if(!salt||!hex) return false;
+  const a=Buffer.from(hex,'hex'); const b=crypto.scryptSync(password,salt,64); return a.length===b.length && crypto.timingSafeEqual(a,b);
+}
+function hashToken(token){ return crypto.createHash('sha256').update(token).digest('hex'); }
+function makeToken(){ return crypto.randomBytes(32).toString('hex'); }
+function cookie(req){ const raw=req.headers.cookie||''; const m=raw.match(/(?:^|;)\s*libratech_session=([^;]+)/); return m?decodeURIComponent(m[1]):null; }
+function cleanUser(u){ if(!u)return null; return {id:u.id,fullName:u.full_name,studentId:u.student_id,email:u.email,username:u.username,role:u.role,courseId:u.course_id,course:u.course_name,yearLevel:u.year_level,sectionId:u.section_id,section:u.section_name,status:u.account_status}; }
+function safeErr(res,e){ console.error(e); if(res.headersSent) return; res.status(e.status||500).json({error:e.publicMessage||'Something went wrong. Please try again.'}); }
+function requireAuth(role){ return async(req,res,next)=>{ try{ const t=cookie(req); if(!t)return res.status(401).json({error:'Authentication required.'}); const s=await get(`SELECT s.*,u.*,c.name course_name,sec.name section_name FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN courses c ON c.id=u.course_id LEFT JOIN sections sec ON sec.id=u.section_id WHERE s.token_hash=? AND datetime(s.expires_at)>datetime('now')`,[hashToken(t)]); if(!s)return res.status(401).json({error:'Session expired. Please sign in again.'}); if(s.account_status!=='active')return res.status(403).json({error:'Your account is inactive.'}); if(role&&s.role!==role)return res.status(403).json({error:'Access denied.'}); req.user=cleanUser(s); next(); }catch(e){safeErr(res,e);} }; }
+function log(userId,action,type,id,details){ return run(`INSERT INTO activity_logs(actor_user_id,action,entity_type,entity_id,details) VALUES(?,?,?,?,?)`,[userId||null,action,type||null,id||null,details||null]); }
+function requireField(v){return v!==undefined&&v!==null&&String(v).trim()!=='';}
+function normalizeDate(s){ const d=new Date(s); return Number.isNaN(d.getTime())?null:d; }
+
+async function init(){
+  const schema=fs.readFileSync(path.join(DB_DIR,'schema.sql'),'utf8');
+  await exec(schema);
+  const settings=[['borrowing_days','7'],['borrowing_limit','3'],['owner_failed_attempts','0'],['owner_locked_until','']];
+  for(const [k,v] of settings) await run('INSERT OR IGNORE INTO system_settings(key,value) VALUES(?,?)',[k,v]);
+  await run("DELETE FROM sessions WHERE datetime(expires_at)<=datetime('now')");
+  const owner=await get(`SELECT id FROM users WHERE username='owner'`);
+  if(!owner){
+    if(!OWNER_DEFAULT_PASSWORD) throw new Error('OWNER_DEFAULT_PASSWORD must be set before creating the default Owner account in production.');
+    const r=await run(`INSERT INTO users(full_name,username,password_hash,role,account_status) VALUES(?,?,?,?,?)`,['LibraTech Owner','owner',hashPassword(OWNER_DEFAULT_PASSWORD),'owner','active']);
+    await log(r.id,'system.owner_created','user',r.id,'Default Owner account initialized.');
+  }
+  const courses=[
+    ['BSIT','Bachelor of Science in Information Technology','IT/Computing'],['BSCS','Bachelor of Science in Computer Science','IT/Computing'],['BSIS','Bachelor of Science in Information Systems','IT/Computing'],['BSCpE','Bachelor of Science in Computer Engineering','Engineering'],['BSBA','Bachelor of Science in Business Administration','Business'],['BSA','Bachelor of Science in Accountancy','Business'],['BSMA','Bachelor of Science in Management Accounting','Business'],['BSHM','Bachelor of Science in Hospitality Management','Hospitality/Tourism'],['BSTM','Bachelor of Science in Tourism Management','Hospitality/Tourism'],['BSOA','Bachelor of Science in Office Administration','Business'],['BSPsych','Bachelor of Science in Psychology','Psychology/Social Sciences'],['BSEd','Bachelor of Science in Education','Education'],['BEEd','Bachelor of Elementary Education','Education'],['BSCrim','Bachelor of Science in Criminology','Criminology'],['BSN','Bachelor of Science in Nursing','Health'],['BSMLS','Bachelor of Science in Medical Laboratory Science','Health'],['BSCE','Bachelor of Science in Civil Engineering','Engineering'],['BSEE','Bachelor of Science in Electrical Engineering','Engineering'],['BSME','Bachelor of Science in Mechanical Engineering','Engineering'],['BSENTREP','Bachelor of Science in Entrepreneurship','Business'],['GENED','General Education','General Education'],['COMM','Communication','General Education'],['MATH','Mathematics','General Education'],['SCI','Sciences','General Education'],['HUM','Humanities','General Education'],['SOCSCI','Social Sciences','Social Sciences']
+  ];
+  for(const c of courses) await run('INSERT OR IGNORE INTO courses(code,name,field_group) VALUES(?,?,?)',c);
+  const sectionNames=['1A','1B','1C','2A','2B','2C','3A','3B','3C','4A','4B','4C'];
+  for(const c of await all('SELECT id FROM courses')) for(const s of sectionNames) await run('INSERT OR IGNORE INTO sections(course_id,name) VALUES(?,?)',[c.id,s]);
+  const count=await get('SELECT COUNT(*) n FROM books');
+  if(count.n===0){
+    const books=[
+      ['BK-0001','9780135957059','Introduction to Programming','Tony Gaddis','Programming','IT/Computing','Pearson',2021,5,'Core programming concepts for beginners.',['BSIT','BSCS','BSIS','BSCpE']],
+      ['BK-0002','9781260598668','System Analysis and Design','Shelly Cashman','Systems Analysis','IT/Computing','McGraw-Hill',2020,4,'Requirements, modeling, and system design.',['BSIT','BSIS','BSCS']],
+      ['BK-0003','9780131873254','Database Management Systems','Raghu Ramakrishnan','Databases','IT/Computing','McGraw-Hill',2019,5,'Database concepts, SQL, and data modeling.',['BSIT','BSCS','BSIS','BSCpE']],
+      ['BK-0004','9780134481265','Web Development Fundamentals','Jon Duckett','Web Development','IT/Computing','Wiley',2020,4,'Modern foundations of web development.',['BSIT','BSCS','BSIS']],
+      ['BK-0005','9780135166307','Computer Networking','James Kurose','Networking','IT/Computing','Pearson',2021,3,'Networking principles and protocols.',['BSIT','BSCS','BSCpE','BSEE']],
+      ['BK-0006','9780134610993','Artificial Intelligence Fundamentals','Tom Taulli','Artificial Intelligence','IT/Computing','CRC Press',2021,3,'Accessible introduction to AI concepts.',['BSIT','BSCS','BSIS','BSCpE']],
+      ['BK-0007','9780136681557','Business Mathematics','Gary Clendenen','Mathematics','Business','Pearson',2022,6,'Mathematical tools for business decisions.',['BSBA','BSA','BSMA','BSENTREP']],
+      ['BK-0008','9781260714785','Financial Accounting','Jerry Weygandt','Accounting','Business','McGraw-Hill',2021,5,'Fundamentals of financial accounting.',['BSA','BSMA','BSBA']],
+      ['BK-0009','9780134492513','Principles of Marketing','Philip Kotler','Marketing','Business','Pearson',2020,4,'Core marketing principles and practice.',['BSBA','BSENTREP','BSHM','BSTM']],
+      ['BK-0010','9781260834308','Entrepreneurship','Robert Hisrich','Entrepreneurship','Business','McGraw-Hill',2022,4,'Starting and managing entrepreneurial ventures.',['BSENTREP','BSBA']],
+      ['BK-0011','9781119781088','Hotel Management','Alan Clarke','Hospitality Management','Hospitality/Tourism','Wiley',2021,4,'Hotel operations and management.',['BSHM','BSTM']],
+      ['BK-0012','9780134783727','Tourism Management','Stephen Page','Tourism','Hospitality/Tourism','Pearson',2020,3,'Tourism planning, policy, and management.',['BSTM','BSHM']],
+      ['BK-0013','9780135209294','Teaching Methods','Marianne Celce-Murcia','Education','Education','Pearson',2021,5,'Approaches to effective classroom teaching.',['BSEd','BEEd']],
+      ['BK-0014','9780135177790','Educational Psychology','Anita Woolfolk','Educational Psychology','Education','Pearson',2020,4,'Learning and development in educational settings.',['BSEd','BEEd','BSPsych']],
+      ['BK-0015','9781317701386','General Psychology','Ciccarelli White','Psychology','Psychology/Social Sciences','Pearson',2021,5,'Introduction to psychology and human behavior.',['BSPsych','BSEd','BEEd','BSN']],
+      ['BK-0016','9781506386705','Research Methods','John Creswell','Research Methods','Social Sciences','SAGE',2018,4,'Research design and methodology across disciplines.',['BSPsych','BSEd','BSN','BSBA','BSIT']],
+      ['BK-0017','9780323792912','Anatomy and Physiology','Kevin Patton','Anatomy','Health','Elsevier',2022,5,'Foundations of human anatomy and physiology.',['BSN','BSMLS']],
+      ['BK-0018','9780323554732','Nutrition Essentials','Mary Grosvenor','Nutrition','Health','Elsevier',2021,4,'Nutrition science and wellness.',['BSN','BSMLS','BSHM']],
+      ['BK-0019','9781260575577','Engineering Mathematics','John Bird','Engineering Mathematics','Engineering','McGraw-Hill',2020,5,'Mathematical methods for engineering.',['BSCE','BSEE','BSME','BSCpE']],
+      ['BK-0020','9780134873738','Engineering Physics','Serway Jewett','Physics','Engineering','Cengage',2019,4,'Physics concepts and applications for engineering.',['BSCE','BSEE','BSME','BSCpE']],
+      ['BK-0021','9780134846015','Criminal Investigation','Charles Swanson','Criminal Investigation','Criminology','McGraw-Hill',2020,4,'Principles and practices of criminal investigation.',['BSCrim']],
+      ['BK-0022','9780134807610','Forensic Science','Richard Saferstein','Forensic Science','Criminology','Pearson',2019,3,'Introduction to forensic science.',['BSCrim','BSMLS']],
+      ['BK-0023','9780199535581','Academic English','Michael Swan','English','General Education','Oxford',2020,5,'Academic English usage and communication.',['GENED','BSEd','BEEd','BSBA']],
+      ['BK-0024','9789712360001','Filipino sa Iba’t Ibang Disiplina','Various','Filipino','General Education','Rex',2021,5,'Filipino language across disciplines.',['GENED','BSEd','BEEd']],
+      ['BK-0025','9780134865122','Human-Computer Interaction','Alan Dix','HCI','IT/Computing','Pearson',2020,3,'Designing usable interactive systems.',['BSIT','BSCS','BSIS','BSENTREP']]
+    ];
+    for(const b of books){
+      const r=await run(`INSERT INTO books(book_code,isbn,title,author,subject_area,category,publisher,publication_year,quantity,available_copies,description) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,b.slice(0,11));
+      for(const code of b[11]){const c=await get('SELECT id FROM courses WHERE code=?',[code]); if(c) await run('INSERT OR IGNORE INTO book_courses(book_id,course_id) VALUES(?,?)',[r.id,c.id]);}
+    }
+  }
+}
+
+app.use((req,res,next)=>{
+  res.setHeader('X-Content-Type-Options','nosniff');
+  res.setHeader('X-Frame-Options','DENY');
+  res.setHeader('Cache-Control', req.path.startsWith('/api/') ? 'no-store' : 'no-cache');
+  res.setHeader('Referrer-Policy','strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=()');
+  if(IS_PRODUCTION) res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
+  next();
+});
+app.use(sameOrigin);
+app.use(express.json({limit:MAX_BODY}));
+app.use(express.urlencoded({extended:false,limit:'100kb'}));
+app.use(express.static(path.join(ROOT,'public'),{dotfiles:'deny',index:'index.html'}));
+
+app.get('/api/health',async(req,res)=>res.json({ok:true,service:'LibraTech'}));
+app.get('/api/config',async(req,res)=>{res.json({borrowingDays:Number((await get("SELECT value FROM system_settings WHERE key='borrowing_days'")).value),borrowingLimit:Number((await get("SELECT value FROM system_settings WHERE key='borrowing_limit'")).value)});});
+
+app.get('/api/courses',async(req,res)=>{try{res.json(await all('SELECT * FROM courses WHERE active=1 ORDER BY name'));}catch(e){safeErr(res,e)}});
+app.get('/api/sections',async(req,res)=>{try{res.json(await all('SELECT s.*,c.code course_code,c.name course_name FROM sections s LEFT JOIN courses c ON c.id=s.course_id WHERE s.active=1 ORDER BY c.name,s.name'));}catch(e){safeErr(res,e)}});
+
+app.post('/api/auth/owner-login',authRateLimit,async(req,res)=>{try{
+  const username=normalize(req.body.username).toLowerCase(), password=String(req.body.password ?? ''); if(!validUsername(username)||password.length>200)return res.status(400).json({error:'Invalid owner credentials.'}); const lock=await get("SELECT value FROM system_settings WHERE key='owner_locked_until'");
+  if(lock?.value && new Date(lock.value)>now()){ const secs=Math.ceil((new Date(lock.value)-now())/1000); return res.status(429).json({error:'Too many failed attempts. Please try again.',locked:true,retryAfter:secs}); }
+  const user=await get(`SELECT u.*,c.name course_name,sec.name section_name FROM users u LEFT JOIN courses c ON c.id=u.course_id LEFT JOIN sections sec ON sec.id=u.section_id WHERE u.username=? AND u.role='owner'`,[username]);
+  if(!user||!verifyPassword(String(password||''),user.password_hash)){
+    let attempts=Number((await get("SELECT value FROM system_settings WHERE key='owner_failed_attempts'")).value||0)+1;
+    if(attempts>=3){const lockUntil=new Date(now().getTime()+30000).toISOString(); await run("UPDATE system_settings SET value=? WHERE key='owner_failed_attempts'",['0']); await run("UPDATE system_settings SET value=? WHERE key='owner_locked_until'",[lockUntil]); return res.status(429).json({error:'Too many failed attempts. Please try again in 30 seconds.',locked:true,retryAfter:30});}
+    await run("UPDATE system_settings SET value=? WHERE key='owner_failed_attempts'",[String(attempts)]); return res.status(401).json({error:'Invalid owner username or password.',attemptsLeft:3-attempts});
+  }
+  await run("UPDATE system_settings SET value='0' WHERE key='owner_failed_attempts'"); await run("UPDATE system_settings SET value='' WHERE key='owner_locked_until'");
+  const token=makeToken(); const exp=addDays(now(),SESSION_DAYS); await run('INSERT INTO sessions(user_id,token_hash,expires_at) VALUES(?,?,?)',[user.id,hashToken(token),iso(exp)]); await run('UPDATE users SET last_login=? WHERE id=?',[iso(),user.id]); await log(user.id,'owner.login','user',user.id,'Owner login successful.');
+  res.setHeader('Set-Cookie',`libratech_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS*86400}${IS_PRODUCTION?'; Secure':''}`); res.json({user:cleanUser(user)});
+}catch(e){safeErr(res,e)}});
+
+app.post('/api/auth/register',authRateLimit,async(req,res)=>{try{
+ const fullName=normalize(req.body.fullName), studentId=normalize(req.body.studentId), email=normalize(req.body.email).toLowerCase(), username=normalize(req.body.username).toLowerCase(), password=String(req.body.password ?? ''), confirmPassword=String(req.body.confirmPassword ?? ''), courseId=normalize(req.body.courseId), yearLevel=normalize(req.body.yearLevel), sectionId=normalize(req.body.sectionId);
+ if(![fullName,studentId,email,username,password,confirmPassword,courseId,yearLevel,sectionId].every(requireField))return res.status(400).json({error:'Please complete all required fields.'});
+ if(!validText(fullName,120)||!validText(studentId,50)||!validEmail(email)||!validUsername(username))return res.status(400).json({error:'Please enter valid account information.'});
+ if(password!==confirmPassword)return res.status(400).json({error:'Passwords do not match.'});
+ if(password.length<8||password.length>200)return res.status(400).json({error:'Password must be 8 to 200 characters.'});
+ if(await get('SELECT id FROM users WHERE username=?',[username]))return res.status(409).json({error:'Username is already registered.'});
+ if(await get('SELECT id FROM users WHERE email=?',[email]))return res.status(409).json({error:'Email is already registered.'});
+ if(await get('SELECT id FROM users WHERE student_id=?',[studentId]))return res.status(409).json({error:'Student ID is already registered.'});
+ const course=await get('SELECT * FROM courses WHERE id=? AND active=1',[courseId]); const sec=await get('SELECT * FROM sections WHERE id=? AND active=1 AND course_id=?',[sectionId,courseId]); if(!course||!sec)return res.status(400).json({error:'Invalid course or section.'});
+ await tx(async()=>{
+   const r=await run(`INSERT INTO users(full_name,student_id,email,username,password_hash,role,course_id,year_level,section_id,account_status) VALUES(?,?,?,?,?,?,?,?,?,'active')`,[fullName,studentId,email,username,hashPassword(password),'client',course.id,yearLevel,sec.id]);
+   await run(`INSERT INTO borrowers(client_user_id,full_name,student_id,email,course_id,year_level,section_id,status) VALUES(?,?,?,?,?,?,?,'active')`,[r.id,fullName,studentId,email,course.id,yearLevel,sec.id]);
+   await log(r.id,'client.register','user',r.id,`Client registered: ${fullName}`);
+   await run(`INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,'success')`,[r.id,'Welcome to LibraTech','Your Client account was created successfully. Please sign in.']);
+ });
+ res.status(201).json({message:'Account successfully created. Please sign in.'});
+}catch(e){safeErr(res,e)}});
+
+app.post('/api/auth/client-login',authRateLimit,async(req,res)=>{try{
+ const username=normalize(req.body.username).toLowerCase(), password=String(req.body.password ?? ''); if(!validUsername(username)||password.length>200)return res.status(400).json({error:'Invalid username or password.'}); const user=await get(`SELECT u.*,c.name course_name,sec.name section_name FROM users u LEFT JOIN courses c ON c.id=u.course_id LEFT JOIN sections sec ON sec.id=u.section_id WHERE u.username=? AND u.role='client'`,[username]);
+ if(!user||!verifyPassword(String(password||''),user.password_hash))return res.status(401).json({error:'Invalid username or password.'}); if(user.account_status!=='active')return res.status(403).json({error:'Your account is inactive. Please contact the library Owner.'});
+ const token=makeToken(); await run('INSERT INTO sessions(user_id,token_hash,expires_at) VALUES(?,?,?)',[user.id,hashToken(token),iso(addDays(now(),SESSION_DAYS))]); await run('UPDATE users SET last_login=? WHERE id=?',[iso(),user.id]); await log(user.id,'client.login','user',user.id,'Client login successful.');
+ res.setHeader('Set-Cookie',`libratech_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS*86400}${IS_PRODUCTION?'; Secure':''}`); res.json({user:cleanUser(user)});
+}catch(e){safeErr(res,e)}});
+
+app.post('/api/auth/logout',async(req,res)=>{try{const t=cookie(req); if(t)await run('DELETE FROM sessions WHERE token_hash=?',[hashToken(t)]); res.setHeader('Set-Cookie',`libratech_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${IS_PRODUCTION?'; Secure':''}`); res.json({ok:true});}catch(e){safeErr(res,e)}});
+app.get('/api/auth/me',requireAuth(),async(req,res)=>res.json({user:req.user}));
+
+app.get('/api/dashboard/owner',requireAuth('owner'),async(req,res)=>{try{
+ const [books,avail,borrowed,overdue,clients,borrowers,activeClients,courses,txs,activities,popular,groups]=await Promise.all([
+ get('SELECT COUNT(*) n FROM books'),get('SELECT COALESCE(SUM(available_copies),0) n FROM books'),get("SELECT COUNT(*) n FROM borrowing_transactions WHERE status IN ('borrowed','overdue')"),get("SELECT COUNT(*) n FROM borrowing_transactions WHERE status='overdue' OR (status='borrowed' AND datetime(due_date)<datetime('now'))"),get("SELECT COUNT(*) n FROM users WHERE role='client'"),get('SELECT COUNT(*) n FROM borrowers'),get("SELECT COUNT(*) n FROM users WHERE role='client' AND account_status='active'"),get('SELECT COUNT(*) n FROM courses WHERE active=1'),all(`SELECT t.*,b.title book_title,br.full_name borrower_name FROM borrowing_transactions t JOIN books b ON b.id=t.book_id JOIN borrowers br ON br.id=t.borrower_id ORDER BY t.created_at DESC LIMIT 8`),all(`SELECT a.*,u.full_name actor_name FROM activity_logs a LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 10`),all(`SELECT b.title,b.author,COUNT(t.id) borrow_count FROM books b LEFT JOIN borrowing_transactions t ON t.book_id=b.id GROUP BY b.id ORDER BY borrow_count DESC,b.title LIMIT 8`),all(`SELECT c.field_group,COUNT(DISTINCT b.id) book_count FROM courses c LEFT JOIN book_courses bc ON bc.course_id=c.id LEFT JOIN books b ON b.id=bc.book_id GROUP BY c.field_group ORDER BY book_count DESC`)
+ ]); res.json({stats:{totalBooks:books.n,availableCopies:avail.n,borrowedCopies:borrowed.n,overdueBooks:overdue.n,totalClients:clients.n,totalBorrowers:borrowers.n,activeClients:activeClients.n,totalCourses:courses.n},transactions:txs,activities,popular,groups});
+}catch(e){safeErr(res,e)}});
+
+app.get('/api/books',requireAuth(),async(req,res)=>{try{
+ const {search='',courseId='',subject='',category='',year='',availability=''}=req.query; let sql=`SELECT b.*,GROUP_CONCAT(c.code || ' — ' || c.name,'||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE 1=1`; const p=[];
+ if(search){sql+=` AND (b.title LIKE ? OR b.author LIKE ? OR b.isbn LIKE ? OR b.book_code LIKE ?)`; const s=`%${search}%`; p.push(s,s,s,s);} if(courseId){sql+=` AND EXISTS(SELECT 1 FROM book_courses x WHERE x.book_id=b.id AND x.course_id=?)`;p.push(courseId);} if(subject){sql+=` AND b.subject_area=?`;p.push(subject);} if(category){sql+=` AND b.category=?`;p.push(category);} if(year){sql+=` AND b.publication_year=?`;p.push(year);} if(availability==='available')sql+=` AND b.available_copies>0`; if(availability==='unavailable')sql+=` AND b.available_copies=0`; sql+=` GROUP BY b.id ORDER BY b.title`;
+ const rows=await all(sql,p); res.json(rows.map(r=>({...r,courses:(r.courses||'').split('||').filter(Boolean)})));
+}catch(e){safeErr(res,e)}});
+
+app.get('/api/books/:id',requireAuth(),async(req,res)=>{try{const r=await get(`SELECT b.*,GROUP_CONCAT(c.code || ' — ' || c.name,'||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE b.id=? GROUP BY b.id`,[req.params.id]); if(!r)return res.status(404).json({error:'Book not found.'}); r.courses=(r.courses||'').split('||').filter(Boolean); res.json(r);}catch(e){safeErr(res,e)}});
+
+app.post('/api/books',requireAuth('owner'),async(req,res)=>{try{const b=req.body;if(![b.bookCode,b.title,b.author,b.subjectArea,b.category,b.quantity].every(requireField))return res.status(400).json({error:'Please complete all required book fields.'});const qty=Number(b.quantity);if(!Number.isInteger(qty)||qty<1)return res.status(400).json({error:'Quantity must be a positive whole number.'});if(await get('SELECT id FROM books WHERE book_code=?',[b.bookCode]))return res.status(409).json({error:'Book ID is already registered.'});if(b.isbn&&await get('SELECT id FROM books WHERE isbn=?',[b.isbn]))return res.status(409).json({error:'ISBN is already registered.'});const r=await run(`INSERT INTO books(book_code,isbn,title,author,subject_area,category,publisher,publication_year,quantity,available_copies,description) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,[b.bookCode,b.isbn||null,b.title,b.author,b.subjectArea,b.category,b.publisher||null,b.publicationYear||null,qty,qty,b.description||null]);for(const cid of (b.courseIds||[]))await run('INSERT OR IGNORE INTO book_courses(book_id,course_id) VALUES(?,?)',[r.id,cid]);await log(req.user.id,'book.added','book',r.id,b.title);res.status(201).json(await get('SELECT * FROM books WHERE id=?',[r.id]));}catch(e){safeErr(res,e)}});
+
+app.put('/api/books/:id',requireAuth('owner'),async(req,res)=>{try{const old=await get('SELECT * FROM books WHERE id=?',[req.params.id]);if(!old)return res.status(404).json({error:'Book not found.'});const b=req.body;const qty=Number(b.quantity);const available=Number(b.availableCopies);if(!Number.isInteger(qty)||qty<0||!Number.isInteger(available)||available<0||available>qty)return res.status(400).json({error:'Quantity and Available Copies must be valid.'});if(await get('SELECT id FROM books WHERE book_code=? AND id<>?',[b.bookCode,req.params.id]))return res.status(409).json({error:'Book ID is already registered.'});await run(`UPDATE books SET book_code=?,isbn=?,title=?,author=?,subject_area=?,category=?,publisher=?,publication_year=?,quantity=?,available_copies=?,description=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`,[b.bookCode,b.isbn||null,b.title,b.author,b.subjectArea,b.category,b.publisher||null,b.publicationYear||null,qty,available,b.description||null,req.params.id]);await run('DELETE FROM book_courses WHERE book_id=?',[req.params.id]);for(const cid of (b.courseIds||[]))await run('INSERT OR IGNORE INTO book_courses(book_id,course_id) VALUES(?,?)',[req.params.id,cid]);await log(req.user.id,'book.updated','book',req.params.id,b.title);res.json({message:'Book successfully updated.'});}catch(e){safeErr(res,e)}});
+
+app.delete('/api/books/:id',requireAuth('owner'),async(req,res)=>{try{const active=await get(`SELECT COUNT(*) n FROM borrowing_transactions WHERE book_id=? AND status IN ('borrowed','overdue')`,[req.params.id]);if(active.n)return res.status(409).json({error:'This book cannot be deleted while it has an active borrowing transaction.'});const b=await get('SELECT title FROM books WHERE id=?',[req.params.id]);if(!b)return res.status(404).json({error:'Book not found.'});await run('DELETE FROM books WHERE id=?',[req.params.id]);await log(req.user.id,'book.deleted','book',req.params.id,b.title);res.json({message:'Book successfully deleted.'});}catch(e){safeErr(res,e)}});
+
+app.get('/api/clients',requireAuth('owner'),async(req,res)=>{try{const {courseId='',status=''}=req.query;let sql=`SELECT u.id,u.full_name,u.student_id,u.email,u.username,u.account_status,u.created_at,u.last_login,c.id course_id,c.code course_code,c.name course_name,u.year_level,s.id section_id,s.name section_name,br.id borrower_id FROM users u LEFT JOIN courses c ON c.id=u.course_id LEFT JOIN sections s ON s.id=u.section_id LEFT JOIN borrowers br ON br.client_user_id=u.id WHERE u.role='client'`;const p=[];if(courseId){sql+=' AND u.course_id=?';p.push(courseId);}if(status){sql+=' AND u.account_status=?';p.push(status);}sql+=' ORDER BY u.created_at DESC';res.json(await all(sql,p));}catch(e){safeErr(res,e)}});
+app.patch('/api/clients/:id/status',requireAuth('owner'),async(req,res)=>{try{const status=req.body.status;if(!['active','inactive'].includes(status))return res.status(400).json({error:'Invalid account status.'});await run('UPDATE users SET account_status=? WHERE id=? AND role=\'client\'',[status,req.params.id]);await run('UPDATE borrowers SET status=? WHERE client_user_id=?',[status,req.params.id]);await log(req.user.id,`client.${status}`,'user',req.params.id,`Client account ${status}.`);res.json({message:`Client account ${status}.`});}catch(e){safeErr(res,e)}});
+
+app.post('/api/borrowers',requireAuth('owner'),async(req,res)=>{try{const b=req.body;if(![b.fullName,b.studentId].every(requireField))return res.status(400).json({error:'Full Name and Student ID are required.'});if(await get('SELECT id FROM borrowers WHERE student_id=?',[b.studentId]))return res.status(409).json({error:'Student ID is already registered as a borrower.'});const r=await run(`INSERT INTO borrowers(full_name,student_id,email,course_id,year_level,section_id,status) VALUES(?,?,?,?,?,?,?)`,[b.fullName,b.studentId,b.email||null,b.courseId||null,b.yearLevel||null,b.sectionId||null,b.status||'active']);await log(req.user.id,'borrower.added','borrower',r.id,b.fullName);res.status(201).json({message:'Borrower successfully added.',id:r.id});}catch(e){safeErr(res,e)}});
+app.put('/api/borrowers/:id',requireAuth('owner'),async(req,res)=>{try{const b=req.body;if(![b.fullName,b.studentId].every(requireField))return res.status(400).json({error:'Full Name and Student ID are required.'});if(await get('SELECT id FROM borrowers WHERE student_id=? AND id<>?',[b.studentId,req.params.id]))return res.status(409).json({error:'Student ID is already registered as a borrower.'});const row=await get('SELECT * FROM borrowers WHERE id=?',[req.params.id]);if(!row)return res.status(404).json({error:'Borrower not found.'});await run(`UPDATE borrowers SET full_name=?,student_id=?,email=?,course_id=?,year_level=?,section_id=?,status=? WHERE id=?`,[b.fullName,b.studentId,b.email||null,b.courseId||null,b.yearLevel||null,b.sectionId||null,b.status||'active',req.params.id]);await log(req.user.id,'borrower.updated','borrower',req.params.id,b.fullName);res.json({message:'Borrower successfully updated.'});}catch(e){safeErr(res,e)}});
+app.delete('/api/borrowers/:id',requireAuth('owner'),async(req,res)=>{try{const active=await get(`SELECT COUNT(*) n FROM borrowing_transactions WHERE borrower_id=? AND status IN ('borrowed','overdue')`,[req.params.id]);if(active.n)return res.status(409).json({error:'Borrower cannot be deleted while an active transaction exists.'});const row=await get('SELECT full_name FROM borrowers WHERE id=?',[req.params.id]);if(!row)return res.status(404).json({error:'Borrower not found.'});await run('DELETE FROM borrowers WHERE id=?',[req.params.id]);await log(req.user.id,'borrower.deleted','borrower',req.params.id,row.full_name);res.json({message:'Borrower successfully deleted.'});}catch(e){safeErr(res,e)}});
+app.get('/api/borrowers',requireAuth('owner'),async(req,res)=>{try{const {courseId='',status=''}=req.query;let sql=`SELECT br.*,c.code course_code,c.name course_name,s.name section_name FROM borrowers br LEFT JOIN courses c ON c.id=br.course_id LEFT JOIN sections s ON s.id=br.section_id WHERE 1=1`;const p=[];if(courseId){sql+=' AND br.course_id=?';p.push(courseId);}if(status){sql+=' AND br.status=?';p.push(status);}sql+=' ORDER BY br.full_name';res.json(await all(sql,p));}catch(e){safeErr(res,e)}});
+
+async function activeBorrowCount(borrowerId){return (await get(`SELECT COUNT(*) n FROM borrowing_transactions WHERE borrower_id=? AND status IN ('borrowed','overdue')`,[borrowerId])).n;}
+async function refreshOverdue(){await run(`UPDATE borrowing_transactions SET status='overdue' WHERE status='borrowed' AND datetime(due_date)<datetime('now')`);}
+
+app.post('/api/transactions/borrow',requireAuth('client'),async(req,res)=>{try{
+ const bookIdNumber=Number(req.body.bookId); if(!Number.isInteger(bookIdNumber)||bookIdNumber<1)return res.status(400).json({error:'Invalid book selection.'}); await refreshOverdue(); const days=Number((await get("SELECT value FROM system_settings WHERE key='borrowing_days'")).value);const result=await tx(async()=>{const borrower=await get(`SELECT br.*,u.account_status,c.name course_name,s.name section_name FROM borrowers br JOIN users u ON u.id=br.client_user_id LEFT JOIN courses c ON c.id=br.course_id LEFT JOIN sections s ON s.id=br.section_id WHERE br.client_user_id=?`,[req.user.id]);if(!borrower||borrower.status!=='active'||borrower.account_status!=='active')throw Object.assign(new Error('Inactive client'),{status:403,publicMessage:'Your account is inactive. Please contact the library Owner.'});const limit=Number((await get("SELECT value FROM system_settings WHERE key='borrowing_limit'")).value);if(await activeBorrowCount(borrower.id)>=limit)throw Object.assign(new Error('Limit'),{status:409,publicMessage:`You have reached the maximum borrowing limit of ${limit} books.`});const book=await get('SELECT * FROM books WHERE id=?',[bookIdNumber]);if(!book)throw Object.assign(new Error('Book not found.'),{status:404,publicMessage:'Book not found.'});if(book.available_copies<1)throw Object.assign(new Error('Unavailable'),{status:409,publicMessage:'Sorry, this book is currently unavailable.'});const duplicate=await get(`SELECT id FROM borrowing_transactions WHERE borrower_id=? AND book_id=? AND status IN ('borrowed','overdue')`,[borrower.id,book.id]);if(duplicate)throw Object.assign(new Error('Already borrowed'),{status:409,publicMessage:'You already have an active borrowing for this book.'});const borrowDate=now();const due=addDays(borrowDate,days);const code=`TXN-${Date.now()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;const r=await run(`INSERT INTO borrowing_transactions(transaction_code,borrower_id,book_id,client_name_snapshot,student_id_snapshot,course_name_snapshot,year_level_snapshot,section_name_snapshot,book_title_snapshot,book_category_snapshot,borrow_date,due_date,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,[code,borrower.id,book.id,borrower.full_name,borrower.student_id,borrower.course_name,borrower.year_level,borrower.section_name,book.title,book.category,iso(borrowDate),iso(due),'borrowed']);const stock=await run('UPDATE books SET available_copies=available_copies-1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND available_copies>0',[book.id]);if(stock.changes!==1)throw Object.assign(new Error('Stock changed'),{status:409,publicMessage:'This book became unavailable. Please try again.'});await log(req.user.id,'book.borrowed','transaction',r.id,`${borrower.full_name} borrowed ${book.title}`);await run(`INSERT INTO notifications(user_id,title,message,type) VALUES(?,?,?,?)`,[req.user.id,'Book successfully borrowed.',`Due date: ${due.toLocaleDateString()}`,'success']);return {id:r.id,transactionCode:code,dueDate:iso(due),bookTitle:book.title};});res.status(201).json({message:'Book successfully borrowed.',...result});
+}catch(e){safeErr(res,e)}});
+
+app.post('/api/transactions/owner-borrow',requireAuth('owner'),async(req,res)=>{try{const {borrowerId,bookId}=req.body;await refreshOverdue();const result=await tx(async()=>{const borrower=await get(`SELECT br.*,c.name course_name,s.name section_name FROM borrowers br LEFT JOIN courses c ON c.id=br.course_id LEFT JOIN sections s ON s.id=br.section_id WHERE br.id=?`,[borrowerId]);if(!borrower||borrower.status!=='active')throw Object.assign(new Error('Borrower inactive'),{status:403,publicMessage:'Borrower is inactive.'});const limit=Number((await get("SELECT value FROM system_settings WHERE key='borrowing_limit'")).value);if(await activeBorrowCount(borrower.id)>=limit)throw Object.assign(new Error('Limit'),{status:409,publicMessage:`This borrower has reached the maximum borrowing limit of ${limit} books.`});const book=await get('SELECT * FROM books WHERE id=?',[bookId]);if(!book)throw Object.assign(new Error('Book not found'),{status:404,publicMessage:'Book not found.'});if(book.available_copies<1)throw Object.assign(new Error('Unavailable'),{status:409,publicMessage:'This book is currently unavailable.'});const duplicate=await get(`SELECT id FROM borrowing_transactions WHERE borrower_id=? AND book_id=? AND status IN ('borrowed','overdue')`,[borrower.id,book.id]);if(duplicate)throw Object.assign(new Error('Duplicate'),{status:409,publicMessage:'This borrower already has an active borrowing for this book.'});const borrowDate=now();const days=Number((await get("SELECT value FROM system_settings WHERE key='borrowing_days'")).value);const due=addDays(borrowDate,days);const code=`TXN-${Date.now()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;const r=await run(`INSERT INTO borrowing_transactions(transaction_code,borrower_id,book_id,client_name_snapshot,student_id_snapshot,course_name_snapshot,year_level_snapshot,section_name_snapshot,book_title_snapshot,book_category_snapshot,borrow_date,due_date,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,[code,borrower.id,book.id,borrower.full_name,borrower.student_id,borrower.course_name,borrower.year_level,borrower.section_name,book.title,book.category,iso(borrowDate),iso(due),'borrowed']);const stock=await run('UPDATE books SET available_copies=available_copies-1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND available_copies>0',[book.id]);if(stock.changes!==1)throw Object.assign(new Error('Stock changed'),{status:409,publicMessage:'This book became unavailable. Please try again.'});await log(req.user.id,'book.borrowed_by_owner','transaction',r.id,`${borrower.full_name} borrowed ${book.title}`);return {transactionCode:code,dueDate:iso(due)};});res.status(201).json({message:'Borrow transaction recorded.',...result});}catch(e){safeErr(res,e)}});
+app.get('/api/transactions',requireAuth(),async(req,res)=>{try{await refreshOverdue();let sql=`SELECT t.*,br.full_name borrower_name,br.student_id,c.code course_code,b.title current_book_title,b.author FROM borrowing_transactions t JOIN borrowers br ON br.id=t.borrower_id LEFT JOIN courses c ON c.id=br.course_id JOIN books b ON b.id=t.book_id WHERE 1=1`;const p=[];if(req.user.role==='client'){const br=await get('SELECT id FROM borrowers WHERE client_user_id=?',[req.user.id]);sql+=' AND t.borrower_id=?';p.push(br?.id||0);}if(req.query.status&&req.query.status!=='all'){sql+=' AND t.status=?';p.push(req.query.status);}if(req.query.courseId){sql+=' AND br.course_id=?';p.push(req.query.courseId);}sql+=' ORDER BY t.borrow_date DESC';res.json(await all(sql,p));}catch(e){safeErr(res,e)}});
+
+app.get('/api/transactions/:id',requireAuth(),async(req,res)=>{try{await refreshOverdue();const t=await get(`SELECT t.*,br.full_name borrower_name,br.student_id,br.email,c.code course_code,c.name course_name,br.year_level,s.name section_name,b.title book_title,b.author,b.isbn,b.book_code FROM borrowing_transactions t JOIN borrowers br ON br.id=t.borrower_id LEFT JOIN courses c ON c.id=br.course_id LEFT JOIN sections s ON s.id=br.section_id JOIN books b ON b.id=t.book_id WHERE t.id=?`,[req.params.id]);if(!t)return res.status(404).json({error:'Transaction not found.'});if(req.user.role==='client'){const me=await get('SELECT id FROM borrowers WHERE client_user_id=?',[req.user.id]);if(!me||me.id!==t.borrower_id)return res.status(403).json({error:'Access denied.'});}res.json(t);}catch(e){safeErr(res,e)}});
+
+app.post('/api/transactions/:id/return',requireAuth('owner'),async(req,res)=>{try{await refreshOverdue();const result=await tx(async()=>{const t=await get('SELECT * FROM borrowing_transactions WHERE id=?',[req.params.id]);if(!t)throw Object.assign(new Error('Not found'),{status:404,publicMessage:'Transaction not found.'});if(t.status==='returned')throw Object.assign(new Error('Returned'),{status:409,publicMessage:'This transaction is already returned.'});const ret=iso();await run(`UPDATE borrowing_transactions SET return_date=?,status='returned' WHERE id=?`,[ret,t.id]);await run('UPDATE books SET available_copies=MIN(quantity,available_copies+1),updated_at=CURRENT_TIMESTAMP WHERE id=?',[t.book_id]);await log(req.user.id,'book.returned','transaction',t.id,`${t.client_name_snapshot} returned ${t.book_title_snapshot}`);return {returnDate:ret};});res.json({message:'Book successfully returned.',...result});}catch(e){safeErr(res,e)}});
+
+app.get('/api/reports',requireAuth('owner'),async(req,res)=>{try{const r=await apiReportData(req.query.type||'inventory');await log(req.user.id,'report.generated','report',null,r.title);res.json(r);}catch(e){safeErr(res,e)}});
+
+app.get('/api/reports/:type/html',requireAuth(),async(req,res)=>{try{const role=req.user.role;if(role!=='owner')return res.status(403).json({error:'Access denied.'});const r=await apiReportData(req.params.type);const escH=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));const cols=r.rows.length?Object.keys(r.rows[0]):[];const html='<!doctype html><html><head><meta charset=\"utf-8\"><title>'+escH(r.title)+'</title><style>body{font-family:Arial,sans-serif;padding:28px;color:#111}h1{margin-bottom:4px}small{color:#555}table{border-collapse:collapse;width:100%;margin-top:20px}th,td{border:1px solid #ccc;padding:7px;text-align:left;font-size:12px}th{background:#eee}</style></head><body><h1>LibraTech — Library Management System</h1><h2>'+escH(r.title)+'</h2><small>Generated: '+escH(r.generatedAt)+' · By: '+escH(r.generatedBy)+' · Records: '+r.rows.length+'</small><table><thead><tr>'+cols.map(c=>'<th>'+escH(c.replaceAll('_',' '))+'</th>').join('')+'</tr></thead><tbody>'+r.rows.map(x=>'<tr>'+cols.map(c=>'<td>'+escH(x[c])+'</td>').join('')+'</tr>').join('')+'</tbody></table></body></html>';res.type('html').send(html)}catch(e){safeErr(res,e)}});
+async function apiReportData(type){await refreshOverdue();let rows=[],title='';switch(type){case'inventory':title='Complete Book Inventory';rows=await all(`SELECT book_code,isbn,title,author,category,subject_area,quantity,available_copies,CASE WHEN available_copies>0 THEN 'Available' ELSE 'Borrowed' END status FROM books ORDER BY title`);break;case'available':title='Available Books';rows=await all(`SELECT book_code,title,author,category,available_copies FROM books WHERE available_copies>0 ORDER BY title`);break;case'borrowed':title='Borrowed Books';rows=await all(`SELECT t.transaction_code,t.client_name_snapshot,t.student_id_snapshot,t.course_name_snapshot,t.book_title_snapshot,t.borrow_date,t.due_date,t.status FROM borrowing_transactions t WHERE t.status IN ('borrowed','overdue') ORDER BY t.due_date`);break;case'overdue':title='Overdue Books';rows=await all(`SELECT t.transaction_code,t.client_name_snapshot,t.student_id_snapshot,t.course_name_snapshot,t.book_title_snapshot,t.borrow_date,t.due_date FROM borrowing_transactions t WHERE t.status='overdue' ORDER BY t.due_date`);break;case'clients':title='Client List';rows=await all(`SELECT u.full_name,u.student_id,u.email,u.username,c.code course_code,c.name course_name,u.year_level,s.name section_name,u.account_status,u.created_at FROM users u LEFT JOIN courses c ON c.id=u.course_id LEFT JOIN sections s ON s.id=u.section_id WHERE u.role='client' ORDER BY u.full_name`);break;case'course':title='Borrowing Activity by Course';rows=await all(`SELECT COALESCE(t.course_name_snapshot,'Unassigned') course,COUNT(*) transactions,SUM(CASE WHEN t.status IN ('borrowed','overdue') THEN 1 ELSE 0 END) active,SUM(CASE WHEN t.status='returned' THEN 1 ELSE 0 END) returned FROM borrowing_transactions t GROUP BY course ORDER BY transactions DESC`);break;case'popular':title='Popular Books';rows=await all(`SELECT book_title_snapshot title,book_category_snapshot category,COUNT(*) borrow_count FROM borrowing_transactions GROUP BY book_id ORDER BY borrow_count DESC,title LIMIT 25`);break;case'categories':title='Books by Category';rows=await all(`SELECT category,COUNT(*) titles,SUM(quantity) copies,SUM(available_copies) available FROM books GROUP BY category ORDER BY titles DESC`);break;default:title='General Library Statistics';rows=[await get(`SELECT COUNT(*) total_books,(SELECT COALESCE(SUM(quantity),0) FROM books) total_copies,(SELECT COALESCE(SUM(available_copies),0) FROM books) available_copies,(SELECT COUNT(*) FROM borrowing_transactions WHERE status IN ('borrowed','overdue')) active_borrowings,(SELECT COUNT(*) FROM borrowing_transactions WHERE status='overdue') overdue_books,(SELECT COUNT(*) FROM users WHERE role='client') total_clients,(SELECT COUNT(*) FROM courses WHERE active=1) total_courses`)];}return{title,generatedAt:iso(),generatedBy:'Owner',rows};}
+app.get('/api/profile',requireAuth('client'),async(req,res)=>{try{const u=await get(`SELECT u.id,u.full_name,u.student_id,u.email,u.username,u.account_status,u.created_at,u.last_login,c.code course_code,c.name course_name,u.year_level,s.name section_name FROM users u LEFT JOIN courses c ON c.id=u.course_id LEFT JOIN sections s ON s.id=u.section_id WHERE u.id=?`,[req.user.id]);res.json(u);}catch(e){safeErr(res,e)}});
+app.patch('/api/profile',requireAuth('client'),async(req,res)=>{try{const {fullName,email}=req.body;const name=normalize(fullName), mail=normalize(email).toLowerCase();if(!validText(name,120)||!validEmail(mail))return res.status(400).json({error:'Please enter a valid Full Name and Email.'});if(await get('SELECT id FROM users WHERE email=? AND id<>?',[mail,req.user.id]))return res.status(409).json({error:'Email is already registered.'});await tx(async()=>{await run('UPDATE users SET full_name=?,email=? WHERE id=?',[name,mail,req.user.id]);await run('UPDATE borrowers SET full_name=?,email=? WHERE client_user_id=?',[name,mail,req.user.id]);await log(req.user.id,'client.profile_updated','user',req.user.id,'Client profile updated.');});res.json({message:'Profile successfully updated.'});}catch(e){safeErr(res,e)}});
+app.get('/api/notifications',requireAuth(),async(req,res)=>{try{res.json(await all('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20',[req.user.id]));}catch(e){safeErr(res,e)}});
+app.get('/api/activity',requireAuth('owner'),async(req,res)=>{try{res.json(await all(`SELECT a.*,u.full_name actor_name FROM activity_logs a LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 100`));}catch(e){safeErr(res,e)}});
+app.get('/api/settings',requireAuth('owner'),async(req,res)=>{try{const rows=await all('SELECT key,value FROM system_settings');const o=Object.fromEntries(rows.map(x=>[x.key,x.value]));res.json({borrowingDays:Number(o.borrowing_days),borrowingLimit:Number(o.borrowing_limit)});}catch(e){safeErr(res,e)}});
+app.patch('/api/settings',requireAuth('owner'),async(req,res)=>{try{const days=Math.max(1,Math.min(60,Number(req.body.borrowingDays)));const limit=Math.max(1,Math.min(10,Number(req.body.borrowingLimit)));if(!Number.isInteger(days)||!Number.isInteger(limit))return res.status(400).json({error:'Settings must be whole numbers.'});await run("UPDATE system_settings SET value=? WHERE key='borrowing_days'",[String(days)]);await run("UPDATE system_settings SET value=? WHERE key='borrowing_limit'",[String(limit)]);await log(req.user.id,'settings.updated','settings',null,`Borrowing period ${days} days; limit ${limit}.`);res.json({message:'Settings updated.'});}catch(e){safeErr(res,e)}});
+
+app.use('/api',(req,res)=>res.status(404).json({error:'API endpoint not found.'}));
+app.get('*',(req,res)=>res.sendFile(path.join(ROOT,'public','index.html')));
+init().then(()=>{
+  setInterval(()=>run("DELETE FROM sessions WHERE datetime(expires_at)<=datetime('now')").catch(()=>{}),60*60*1000).unref();
+  setInterval(()=>{const cutoff=Date.now()-AUTH_WINDOW_MS;for(const [k,v] of authBuckets)if(v.start<cutoff)authBuckets.delete(k);},AUTH_WINDOW_MS).unref();
+  app.listen(PORT,()=>console.log(`LibraTech running at http://localhost:${PORT}`));
+}).catch(e=>{console.error(e);process.exit(1)});

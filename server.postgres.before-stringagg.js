@@ -231,12 +231,12 @@ app.get('/api/dashboard/owner',requireAuth('owner'),async(req,res)=>{try{
 }catch(e){safeErr(res,e)}});
 
 app.get('/api/books',requireAuth(),async(req,res)=>{try{
- const {search='',courseId='',subject='',category='',year='',availability=''}=req.query; let sql=`SELECT b.*,STRING_AGG(c.code || ' â€” ' || c.name, '||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE 1=1`; const p=[];
+ const {search='',courseId='',subject='',category='',year='',availability=''}=req.query; let sql=`SELECT b.*,GROUP_CONCAT(c.code || ' â€” ' || c.name,'||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE 1=1`; const p=[];
  if(search){sql+=` AND (b.title LIKE ? OR b.author LIKE ? OR b.isbn LIKE ? OR b.book_code LIKE ?)`; const s=`%${search}%`; p.push(s,s,s,s);} if(courseId){sql+=` AND EXISTS(SELECT 1 FROM book_courses x WHERE x.book_id=b.id AND x.course_id=?)`;p.push(courseId);} if(subject){sql+=` AND b.subject_area=?`;p.push(subject);} if(category){sql+=` AND b.category=?`;p.push(category);} if(year){sql+=` AND b.publication_year=?`;p.push(year);} if(availability==='available')sql+=` AND b.available_copies>0`; if(availability==='unavailable')sql+=` AND b.available_copies=0`; sql+=` GROUP BY b.id ORDER BY b.title`;
  const rows=await all(sql,p); res.json(rows.map(r=>({...r,courses:(r.courses||'').split('||').filter(Boolean)})));
 }catch(e){safeErr(res,e)}});
 
-app.get('/api/books/:id',requireAuth(),async(req,res)=>{try{const r=await get(`SELECT b.*,STRING_AGG(c.code || ' â€” ' || c.name, '||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE b.id=? GROUP BY b.id`,[req.params.id]); if(!r)return res.status(404).json({error:'Book not found.'}); r.courses=(r.courses||'').split('||').filter(Boolean); res.json(r);}catch(e){safeErr(res,e)}});
+app.get('/api/books/:id',requireAuth(),async(req,res)=>{try{const r=await get(`SELECT b.*,GROUP_CONCAT(c.code || ' â€” ' || c.name,'||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE b.id=? GROUP BY b.id`,[req.params.id]); if(!r)return res.status(404).json({error:'Book not found.'}); r.courses=(r.courses||'').split('||').filter(Boolean); res.json(r);}catch(e){safeErr(res,e)}});
 
 app.post('/api/books',requireAuth('owner'),async(req,res)=>{try{const b=req.body;if(![b.bookCode,b.title,b.author,b.subjectArea,b.category,b.quantity].every(requireField))return res.status(400).json({error:'Please complete all required book fields.'});const qty=Number(b.quantity);if(!Number.isInteger(qty)||qty<1)return res.status(400).json({error:'Quantity must be a positive whole number.'});if(await get('SELECT id FROM books WHERE book_code=?',[b.bookCode]))return res.status(409).json({error:'Book ID is already registered.'});if(b.isbn&&await get('SELECT id FROM books WHERE isbn=?',[b.isbn]))return res.status(409).json({error:'ISBN is already registered.'});const r=await run(`INSERT INTO books(book_code,isbn,title,author,subject_area,category,publisher,publication_year,quantity,available_copies,description) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,[b.bookCode,b.isbn||null,b.title,b.author,b.subjectArea,b.category,b.publisher||null,b.publicationYear||null,qty,qty,b.description||null]);for(const cid of (b.courseIds||[]))await run('INSERT OR IGNORE INTO book_courses(book_id,course_id) VALUES(?,?)',[r.id,cid]);await log(req.user.id,'book.added','book',r.id,b.title);res.status(201).json(await get('SELECT * FROM books WHERE id=?',[r.id]));}catch(e){safeErr(res,e)}});
 
@@ -508,12 +508,12 @@ app.get('/api/dashboard/owner',requireAuth('owner'),async(req,res)=>{try{
 }catch(e){safeErr(res,e)}});
 
 app.get('/api/books',requireAuth(),async(req,res)=>{try{
- const {search='',courseId='',subject='',category='',year='',availability=''}=req.query; let sql=`SELECT b.*,STRING_AGG(c.code || ' â€” ' || c.name, '||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE 1=1`; const p=[];
+ const {search='',courseId='',subject='',category='',year='',availability=''}=req.query; let sql=`SELECT b.*,GROUP_CONCAT(c.code || ' â€” ' || c.name,'||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE 1=1`; const p=[];
  if(search){sql+=` AND (b.title LIKE ? OR b.author LIKE ? OR b.isbn LIKE ? OR b.book_code LIKE ?)`; const s=`%${search}%`; p.push(s,s,s,s);} if(courseId){sql+=` AND EXISTS(SELECT 1 FROM book_courses x WHERE x.book_id=b.id AND x.course_id=?)`;p.push(courseId);} if(subject){sql+=` AND b.subject_area=?`;p.push(subject);} if(category){sql+=` AND b.category=?`;p.push(category);} if(year){sql+=` AND b.publication_year=?`;p.push(year);} if(availability==='available')sql+=` AND b.available_copies>0`; if(availability==='unavailable')sql+=` AND b.available_copies=0`; sql+=` GROUP BY b.id ORDER BY b.title`;
  const rows=await all(sql,p); res.json(rows.map(r=>({...r,courses:(r.courses||'').split('||').filter(Boolean)})));
 }catch(e){safeErr(res,e)}});
 
-app.get('/api/books/:id',requireAuth(),async(req,res)=>{try{const r=await get(`SELECT b.*,STRING_AGG(c.code || ' â€” ' || c.name, '||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE b.id=? GROUP BY b.id`,[req.params.id]); if(!r)return res.status(404).json({error:'Book not found.'}); r.courses=(r.courses||'').split('||').filter(Boolean); res.json(r);}catch(e){safeErr(res,e)}});
+app.get('/api/books/:id',requireAuth(),async(req,res)=>{try{const r=await get(`SELECT b.*,GROUP_CONCAT(c.code || ' â€” ' || c.name,'||') courses FROM books b LEFT JOIN book_courses bc ON bc.book_id=b.id LEFT JOIN courses c ON c.id=bc.course_id WHERE b.id=? GROUP BY b.id`,[req.params.id]); if(!r)return res.status(404).json({error:'Book not found.'}); r.courses=(r.courses||'').split('||').filter(Boolean); res.json(r);}catch(e){safeErr(res,e)}});
 
 app.post('/api/books',requireAuth('owner'),async(req,res)=>{try{const b=req.body;if(![b.bookCode,b.title,b.author,b.subjectArea,b.category,b.quantity].every(requireField))return res.status(400).json({error:'Please complete all required book fields.'});const qty=Number(b.quantity);if(!Number.isInteger(qty)||qty<1)return res.status(400).json({error:'Quantity must be a positive whole number.'});if(await get('SELECT id FROM books WHERE book_code=?',[b.bookCode]))return res.status(409).json({error:'Book ID is already registered.'});if(b.isbn&&await get('SELECT id FROM books WHERE isbn=?',[b.isbn]))return res.status(409).json({error:'ISBN is already registered.'});const r=await run(`INSERT INTO books(book_code,isbn,title,author,subject_area,category,publisher,publication_year,quantity,available_copies,description) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,[b.bookCode,b.isbn||null,b.title,b.author,b.subjectArea,b.category,b.publisher||null,b.publicationYear||null,qty,qty,b.description||null]);for(const cid of (b.courseIds||[]))await run('INSERT OR IGNORE INTO book_courses(book_id,course_id) VALUES(?,?)',[r.id,cid]);await log(req.user.id,'book.added','book',r.id,b.title);res.status(201).json(await get('SELECT * FROM books WHERE id=?',[r.id]));}catch(e){safeErr(res,e)}});
 
@@ -565,7 +565,6 @@ init().then(()=>{
 
 
 module.exports = app;
-
 
 
 

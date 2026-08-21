@@ -29,10 +29,8 @@ CREATE TABLE IF NOT EXISTS sections (
   course_id INTEGER,
   name TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
-  UNIQUE (course_id, name),
-  FOREIGN KEY (course_id)
-    REFERENCES courses(id)
-    ON DELETE SET NULL
+  UNIQUE(course_id, name),
+  FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS books (
@@ -57,12 +55,8 @@ CREATE TABLE IF NOT EXISTS book_courses (
   book_id INTEGER NOT NULL,
   course_id INTEGER NOT NULL,
   PRIMARY KEY (book_id, course_id),
-  FOREIGN KEY (book_id)
-    REFERENCES books(id)
-    ON DELETE CASCADE,
-  FOREIGN KEY (course_id)
-    REFERENCES courses(id)
-    ON DELETE CASCADE
+  FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE,
+  FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS borrowers (
@@ -77,15 +71,9 @@ CREATE TABLE IF NOT EXISTS borrowers (
   status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'inactive')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (client_user_id)
-    REFERENCES users(id)
-    ON DELETE SET NULL,
-  FOREIGN KEY (course_id)
-    REFERENCES courses(id)
-    ON DELETE SET NULL,
-  FOREIGN KEY (section_id)
-    REFERENCES sections(id)
-    ON DELETE SET NULL
+  FOREIGN KEY (client_user_id) REFERENCES users(id) ON DELETE SET NULL,
+  FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE SET NULL,
+  FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS borrowing_transactions (
@@ -106,10 +94,8 @@ CREATE TABLE IF NOT EXISTS borrowing_transactions (
   status TEXT NOT NULL
     CHECK (status IN ('borrowed', 'overdue', 'returned')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (borrower_id)
-    REFERENCES borrowers(id),
-  FOREIGN KEY (book_id)
-    REFERENCES books(id)
+  FOREIGN KEY (borrower_id) REFERENCES borrowers(id),
+  FOREIGN KEY (book_id) REFERENCES books(id)
 );
 
 CREATE TABLE IF NOT EXISTS activity_logs (
@@ -120,9 +106,7 @@ CREATE TABLE IF NOT EXISTS activity_logs (
   entity_id INTEGER,
   details TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (actor_user_id)
-    REFERENCES users(id)
-    ON DELETE SET NULL
+  FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -133,9 +117,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   type TEXT NOT NULL DEFAULT 'info',
   is_read INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id)
-    REFERENCES users(id)
-    ON DELETE CASCADE
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -144,9 +126,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT NOT NULL UNIQUE,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id)
-    REFERENCES users(id)
-    ON DELETE CASCADE
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS system_settings (
